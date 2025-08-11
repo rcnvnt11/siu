@@ -9,9 +9,9 @@
 import 'dotenv/config';
 import inquirer from 'inquirer';
 import { performance } from 'node:perf_hooks';
-import { SuiClient, getFullnodeUrl, Transaction as TransactionBlock } from '@mysten/sui.js/client';
-import { Ed25519Keypair } from '@mysten/sui.js/keypairs/ed25519';
-import { fromHEX } from '@mysten/sui.js/utils';
+import { SuiClient, getFullnodeUrl, Transaction as TransactionBlock } from '@mysten/sui/client';
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { fromHEX } from '@mysten/sui/utils';
 import { decode as b64decode } from 'base64-arraybuffer';
 
 // --- Aggregator SDKs (pakai sesuai menu DEX) ---
