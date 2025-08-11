@@ -1,14 +1,16 @@
 {
-  "name": "mint-bot",
+  "name": "sui",
   "version": "1.0.0",
-  "description": "Simple & advanced NFT mint bot using ethers.js with retry and gas bump.",
-  "main": "mint-bot.js",
-  "license": "MIT",
+  "type": "module",
+  "main": "bot.js",
   "scripts": {
-    "start": "node mint-bot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
+    "@mysten/sui.js": "^0.54.0",
+    "@cetusprotocol/aggregator-sdk": "^1.0.0",
+    "@flowx-finance/sdk": "^1.0.0",
     "dotenv": "^16.4.5",
-    "ethers": "^5.7.2"
+    "inquirer": "^9.2.11"
   }
 }
