@@ -1,5 +1,5 @@
 {
-  "name": "siu",
+  "name": "sui-auto-sell-bot",
   "version": "1.0.0",
   "type": "module",
   "main": "bot.js",
@@ -7,10 +7,10 @@
     "start": "node bot.js"
   },
   "dependencies": {
-    "@mysten/sui.js": "^0.54.0",
-    "@cetusprotocol/aggregator-sdk": "^1.0.0",
-    "@flowx-finance/sdk": "^1.0.0",
+    "@mysten/sui": "^1.37.0",
+    "@cetusprotocol/aggregator-sdk": "0.14.2",
+    "@flowx-finance/sdk": "^1.5.0",
     "dotenv": "^16.4.5",
-    "inquirer": "^9.2.11"
+    "inquirer": "^12.9.1"
   }
 }
