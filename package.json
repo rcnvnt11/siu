@@ -1,0 +1,14 @@
+{
+  "name": "mint-bot",
+  "version": "1.0.0",
+  "description": "Simple & advanced NFT mint bot using ethers.js with retry and gas bump.",
+  "main": "mint-bot.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node mint-bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^5.7.2"
+  }
+}
