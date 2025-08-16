@@ -1,324 +1,441 @@
 #!/usr/bin/env node
 /**
- * SUI MEME COIN AUTO-SELLER (Multi-Token, Menu, Aggregator)
- * - Ready-to-run: RPC/HTTP default → Sui mainnet (resmi Mysten)
- * - Kamu cukup isi PRIVATE_KEY di .env, lalu tambah token target dari menu
- * - DEX: Cetus Aggregator (aggressgator ON), FlowX, BlueMove (via aggregator)
+ * SUI AUTO-SELL — Aftermath Router (ultra-fast)
+ * ---------------------------------------------
+ * - Deteksi BUY via 0x2::coin::TransferEvent<COIN> + checkpoint walker cepat.
+ * - TX panas (prebuild) adaptif: submit ~<2s setelah trigger (tergantung RPC).
+ * - ON/OFF per token; saat ON diminta Sell% dan disimpan ke tokens.json.
+ *
+ * ENV:
+ *   PRIVATE_KEY=0x...              # ed25519 hex (64/32 bytes OK)
+ *   HTTP_URL=https://fullnode.mainnet.sui.io:443
+ *
+ * Install:
+ *   npm i aftermath-ts-sdk@1.3.17 --legacy-peer-deps @mysten/sui inquirer dotenv
  */
 
 import 'dotenv/config';
 import inquirer from 'inquirer';
 import { performance } from 'node:perf_hooks';
-import { SuiClient, getFullnodeUrl, Transaction as TransactionBlock } from '@mysten/sui/client';
+import { appendFile, mkdir, readFile, writeFile } from 'fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { fromHEX } from '@mysten/sui/utils';
-import { decode as b64decode } from 'base64-arraybuffer';
 
-// --- Aggregator SDKs (pakai sesuai menu DEX) ---
-import { AggregatorClient as CetusAggClient } from '@cetusprotocol/aggregator-sdk';
-import { AggregatorQuoter, NETWORK as FLOWX_NET, TradeBuilder } from '@flowx-finance/sdk';
+const SUI = '0x2::sui::SUI';
+const HTTP_URL = process.env.HTTP_URL || 'https://fullnode.mainnet.sui.io:443';
+const PRIVATE_KEY = (process.env.PRIVATE_KEY || '').trim();
+if (!PRIVATE_KEY) { console.error('❌ PRIVATE_KEY belum diisi di .env'); process.exit(1); }
 
-// ---------- DEFAULT RPC (siap pakai) ----------
-const DEFAULT_HTTP = getFullnodeUrl('mainnet');     // ex: https://fullnode.mainnet.sui.io:443
-
-// ---------- ENV ----------
-const HTTP_URL = process.env.HTTP_URL || DEFAULT_HTTP;
-const OWNER_ENV = process.env.OWNER_ADDRESS || '';
-const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
-
-if (!PRIVATE_KEY) {
-  console.error('❌ PRIVATE_KEY belum diisi di .env');
-  process.exit(1);
-}
-
-const DEFAULTS = {
-  sellPercent: Number(process.env.DEFAULT_SELL_PERCENT || 100),
-  minSellRaw: BigInt(process.env.DEFAULT_MIN_SELL_RAW || '0'),
-  cooldownMs: Number(process.env.DEFAULT_COOLDOWN_MS || 3000),
-  slippageBps: Number(process.env.DEFAULT_SLIPPAGE_BPS || 100), // 1%
-  quoteCoin: process.env.QUOTE_COIN || '0x2::sui::SUI', // Pair SUI/XXXX
-  dexPref: (process.env.DEX_PREF || 'cetus_agg'),       // cetus_agg | flowx | bluemove
-};
-
-// ---------- SUI CLIENT ----------
 const client = new SuiClient({ url: HTTP_URL });
-
 function keypairFromEnv(pk) {
-  if (pk.startsWith('0x')) return Ed25519Keypair.fromSeed(fromHEX(pk).slice(0, 32));
-  const raw = new Uint8Array(b64decode(pk));
-  return Ed25519Keypair.fromSeed(raw.slice(-32));
+  const hex = pk.startsWith('0x') ? pk.slice(2) : pk;
+  const bytes = fromHEX(hex);
+  const sk = bytes.length === 64 ? bytes.slice(32) : bytes;
+  return Ed25519Keypair.fromSecretKey(sk);
 }
 const keypair = keypairFromEnv(PRIVATE_KEY);
-const OWNER = OWNER_ENV || keypair.toSuiAddress();
+const OWNER = keypair.getPublicKey().toSuiAddress();
 
-// ---------- STATE ----------
-const tokenMap = new Map(); // coinType => { sellPercent, minSellRaw, cooldownMs, slippageBps, dex, running, lastSellMs, _unsub }
+// ---------- IO ----------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+const TOKENS_PATH = join(__dirname, 'tokens.json');
+const LOG_PATH    = join(__dirname, 'activity.log');
 
-// ---------- UTIL ----------
-async function getBalanceRaw(owner, coinType) {
-  const r = await client.getBalance({ owner, coinType });
-  return BigInt(r.totalBalance || '0');
-}
-const now = () => Date.now();
-const msSince = (t) => now() - (t || 0);
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// ---------- DEX ADAPTERS ----------
-async function sellViaCetusAgg({ coinIn, amountIn, coinOut, slippageBps }) {
-  const agg = new CetusAggClient({
-    fullnodeUrl: HTTP_URL,
-    networkType: 'mainnet',
-  });
-
-  const routers = await agg.findRouters({
-    from: coinIn,
-    target: coinOut,
-    amount: String(amountIn),
-    byAmountIn: true,
-  });
-  if (!routers?.length) throw new Error('No route from Cetus Aggregator');
-
-  const txb = new TransactionBlock();
-  await agg.fastRouterSwap({
-    routers,
-    txb,
-    slippage: slippageBps / 1e4, // 100 bps => 0.01
-  });
-
-  const res = await client.signAndExecuteTransactionBlock({
-    signer: keypair,
-    transactionBlock: txb,
-    options: { showEffects: true, showEvents: true },
-    requestType: 'WaitForLocalExecution',
-  });
-  if (res?.effects?.status?.status !== 'success') throw new Error('CetusAgg tx failed');
-  return res;
+async function readJsonSafe(p, d){ try{ return JSON.parse(await readFile(p,'utf8')); }catch{ return d; } }
+async function writeJson(p,v){ await writeFile(p, JSON.stringify(v,null,2)); }
+async function logActivity(line){
+  const ts = new Date().toISOString();
+  const row = `[${ts}] ${line}\n`;
+  try{
+    await appendFile(LOG_PATH, row).catch(async()=>{ await mkdir(dirname(LOG_PATH),{recursive:true}); await appendFile(LOG_PATH,row); });
+  }catch{}
 }
 
-async function sellViaFlowX({ coinIn, amountIn, coinOut, slippageBps }) {
-  const quoter = new AggregatorQuoter('mainnet');
-  const routes = await quoter.getRoutes({
-    tokenIn: coinIn,
-    tokenOut: coinOut,
-    amountIn: String(amountIn),
-  });
-  if (!routes?.length) throw new Error('No FlowX route');
+// ---------- utils ----------
+const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
+const toBig = (v)=> { try{ return typeof v==='bigint'? v : BigInt(v??0); }catch{ return 0n; } };
+const toNum = (v,d=0)=> Number.isFinite(Number(v)) ? Number(v) : d;
+const now = ()=> Date.now();
+function isCoinType(s){ return /^0x[0-9a-fA-F]+::[A-Za-z0-9_]+::[A-Za-z0-9_]+$/.test(s||''); }
+async function getBalanceRaw(owner, coinType){ const r = await client.getBalance({ owner, coinType }); return BigInt(r.totalBalance||'0'); }
+async function getSuiBalanceStr(){ const raw = await getBalanceRaw(OWNER,SUI); const s=raw.toString().padStart(10,'0'); const i=s.slice(0,-9)||'0', f=s.slice(-9).replace(/0+$/,''); return f?`${i}.${f}`:i; }
 
-  const builder = new TradeBuilder(FLOWX_NET.MAINNET, routes);
-  const trade = builder
-    .sender(OWNER)
-    .amountIn(String(amountIn))
-    .slippage(slippageBps * 1e4)      // FlowX expects 1e6 scale
-    .deadline(Date.now() + 60 * 1000)
-    .build();
-
-  const txb = trade.swap({ client });
-  const res = await client.signAndExecuteTransactionBlock({
-    signer: keypair,
-    transactionBlock: txb,
-    options: { showEffects: true, showEvents: true },
-    requestType: 'WaitForLocalExecution',
-  });
-  if (res?.effects?.status?.status !== 'success') throw new Error('FlowX tx failed');
-  return res;
-}
-
-async function sellViaBlueMoveFallback(p) {
-  // BlueMove fallback via Cetus Aggregator
-  return sellViaCetusAgg(p);
-}
-
-async function sellOnce({ coinType, cfg }) {
-  const bal = await getBalanceRaw(OWNER, coinType);
-  if (bal <= 0n) return { skipped: 'no_balance' };
-
-  let amount = (bal * BigInt(cfg.sellPercent)) / 100n;
-  if (amount < cfg.minSellRaw) return { skipped: 'below_min' };
-
-  const params = {
-    coinIn: coinType,
-    amountIn: amount,
-    coinOut: DEFAULTS.quoteCoin,
-    slippageBps: cfg.slippageBps ?? DEFAULTS.slippageBps,
+// ---------- tokens store (persist) ----------
+function normalizeCfg(raw={}){
+  return {
+    sellPercent: Math.min(100, Math.max(1, toNum(raw.sellPercent, 100))),
+    minSellRaw:  toBig(raw.minSellRaw ?? 0),
+    cooldownMs:  Math.max(200, toNum(raw.cooldownMs, 900)),
+    slippageBps: Math.max(1, toNum(raw.slippageBps, 200)),  // 2%
+    running:     !!raw.running,
+    lastSellMs:  toNum(raw.lastSellMs, 0),
   };
-
-  if (cfg.dex === 'cetus_agg') return sellViaCetusAgg(params);
-  if (cfg.dex === 'flowx')     return sellViaFlowX(params);
-  if (cfg.dex === 'bluemove')  return sellViaBlueMoveFallback(params);
-  throw new Error(`Unknown DEX: ${cfg.dex}`);
 }
-
-// ---------- BUY detector ----------
-async function startListener(coinType) {
-  const cfg = tokenMap.get(coinType);
-  if (!cfg || cfg.running) return;
-  cfg.running = true;
-  cfg.lastSellMs = 0;
-
-  const handler = async (evt) => {
-    try {
-      const t0 = performance.now();
-      const etype = (evt.type || '').toLowerCase();
-      if (!etype.includes('swap')) return;
-
-      const blob = JSON.stringify(evt.parsedJson || evt.fields || evt);
-      if (!blob.includes(coinType)) return;
-
-      if (msSince(cfg.lastSellMs) < cfg.cooldownMs) return;
-
-      const res = await sellOnce({ coinType, cfg });
-      if (res?.effects?.status?.status === 'success') {
-        cfg.lastSellMs = now();
-        console.log(`[SELL OK] ${coinType} via ${cfg.dex} tx=${res.digest} in ${(performance.now()-t0).toFixed(0)}ms`);
-      }
-    } catch (e) {
-      console.warn(`[SELL ERR] ${coinType}:`, e?.message || e);
-    }
-  };
-
-  // subscribe broad; SDK akan handle WS sendiri dari HTTP_URL base
-  const unsub = await client.subscribeEvent({ filter: { All: [] } }, handler);
-  cfg._unsub = unsub;
-  console.log(`[RUN] listening BUY for ${coinType} on ${cfg.dex}…`);
-}
-
-async function stopListener(coinType) {
-  const cfg = tokenMap.get(coinType);
-  if (!cfg?.running) return;
-  cfg.running = false;
-  if (cfg._unsub) {
-    try { await cfg._unsub(); } catch {}
-    cfg._unsub = null;
+async function loadTokens(){
+  const data = await readJsonSafe(TOKENS_PATH, {});
+  const map = new Map();
+  if (Array.isArray(data)) {
+    for (const it of data) if (it?.coinType && isCoinType(it.coinType)) map.set(it.coinType, normalizeCfg(it));
+  } else if (data && typeof data==='object') {
+    for (const [k,v] of Object.entries(data)) if (isCoinType(k)) map.set(k, normalizeCfg(v));
   }
-  console.log(`[STOP] ${coinType}`);
+  return map;
+}
+let TOKENS = await loadTokens();
+async function saveTokens(){
+  const obj = {};
+  for (const [k,vRaw] of TOKENS){
+    const v = normalizeCfg(vRaw);
+    obj[k] = { sellPercent:v.sellPercent, minSellRaw:v.minSellRaw.toString(), cooldownMs:v.cooldownMs, slippageBps:v.slippageBps, running:v.running, lastSellMs:v.lastSellMs };
+  }
+  await writeJson(TOKENS_PATH, obj);
+}
+
+// ---------- Aftermath dynamic import ----------
+let AF = null, ROUTER = null;
+async function ensureAftermath(){
+  if (ROUTER) return ROUTER;
+  const mod = await import('aftermath-ts-sdk'); // v1.3.17
+  AF = mod.Aftermath;
+  ROUTER = new AF('MAINNET').Router();
+  return ROUTER;
+}
+
+// ---------- HOT TX (prebuild) ----------
+/**
+ * HOT.get(coinType) -> { bytes, amountIn, slippageBps, ts }
+ */
+const HOT = new Map();
+const HOT_TTL_MS = 6000;
+const MIN_CHANGE_BPS = 50;      // 0.5%
+const PREP_MIN_MS = 600, PREP_MAX_MS = 5000;
+
+const PREP_STATE = new Map();   // coinType -> { intervalMs, lastAmountIn, stop }
+async function prepareHotTx(coinType, cfgRaw){
+  const cfg = normalizeCfg(cfgRaw);
+  try{
+    const bal = await getBalanceRaw(OWNER, coinType);
+    const amountIn = (bal * BigInt(cfg.sellPercent)) / 100n;
+    if (amountIn <= 0n || amountIn < cfg.minSellRaw) { HOT.set(coinType,null); return { skipped:true }; }
+
+    const st = PREP_STATE.get(coinType) || { lastAmountIn:0n, intervalMs:1000 };
+    const last = HOT.get(coinType);
+    const delta = st.lastAmountIn? (amountIn>st.lastAmountIn? amountIn-st.lastAmountIn : st.lastAmountIn-amountIn) : 0n;
+    const deltaBps = st.lastAmountIn? Number((delta*10000n)/st.lastAmountIn) : 10000;
+    const valid = last && (Date.now()-last.ts) <= HOT_TTL_MS;
+    if (valid && deltaBps < MIN_CHANGE_BPS) return { skipped:true };
+
+    const router = await ensureAftermath();
+    const route = await router.getCompleteTradeRouteGivenAmountIn({ coinInType: coinType, coinOutType: SUI, coinInAmount: amountIn });
+    if (!route || !route.routes?.length){ HOT.set(coinType,null); return { skipped:true }; }
+
+    const tx = await router.getTransactionForCompleteTradeRoute({
+      walletAddress: OWNER,
+      completeRoute: route,
+      slippage: Math.max(1, Number(cfg.slippageBps))/10_000, // bps -> decimal
+    });
+    const bytes = await tx.build({ client });
+    HOT.set(coinType, { bytes, amountIn, slippageBps: cfg.slippageBps, ts: Date.now() });
+    PREP_STATE.set(coinType, { ...st, lastAmountIn: amountIn });
+    return { ok:true };
+  }catch(e){
+    const m = String(e?.message||e);
+    if (m.includes('429')) return { rateLimited:true };
+    return { skipped:true };
+  }
+}
+async function startPrebuilder(coinType){
+  if (PREP_STATE.has(coinType)) return;
+  let alive = true;
+  PREP_STATE.set(coinType, { intervalMs: 1000, lastAmountIn: 0n, stop:()=>{ alive=false; } });
+  (async()=>{
+    while(alive){
+      const cfg = TOKENS.get(coinType) || {};
+      const st  = PREP_STATE.get(coinType) || { intervalMs: 1000, lastAmountIn:0n };
+      const r = await prepareHotTx(coinType, cfg);
+      let next = st.intervalMs;
+      if (r?.rateLimited) next = Math.min(PREP_MAX_MS, Math.round(st.intervalMs*1.8)+(Math.random()*200|0));
+      else if (r?.ok)    next = Math.max(PREP_MIN_MS, Math.round(st.intervalMs*0.85));
+      else               next = Math.max(PREP_MIN_MS, Math.round(st.intervalMs*0.95));
+      PREP_STATE.set(coinType, { ...(PREP_STATE.get(coinType)||{}), intervalMs: next });
+      await sleep(next);
+    }
+  })();
+}
+async function stopPrebuilder(coinType){
+  const st = PREP_STATE.get(coinType);
+  if (st?.stop){ try{ st.stop(); }catch{} }
+  PREP_STATE.delete(coinType);
+  HOT.delete(coinType);
+}
+
+// ---------- submit (pakai HOT; retry 429) ----------
+async function submitHotOrCold(coinType){
+  const cfg = normalizeCfg(TOKENS.get(coinType) || {});
+  const cached = HOT.get(coinType);
+  const t0 = performance.now();
+
+  async function submitBytes(bytes){
+    // Paling cepat: requestType 'Submit' + no effects.
+    for(let i=0;i<3;i++){
+      try{
+        const res = await client.signAndExecuteTransaction({
+          signer: keypair,
+          transaction: bytes,
+          options: { showEffects: false },
+          requestType: 'Submit',
+        });
+        return res;
+      }catch(e){
+        const m = String(e?.message||e);
+        if (!m.includes('429')) throw e;
+        await sleep(180 + i*140);
+      }
+    }
+    // Fallback (lebih lambat, tapi lebih stabil)
+    return await client.signAndExecuteTransaction({
+      signer: keypair, transaction: bytes,
+      options: { showEffects: true }, requestType: 'WaitForLocalExecution',
+    });
+  }
+
+  try{
+    if (cached && (Date.now()-cached.ts) <= HOT_TTL_MS){
+      const res = await submitBytes(cached.bytes);
+      const ms = (performance.now()-t0).toFixed(0);
+      console.log(`[SELL SUBMITTED/HOT] ${coinType} amountRaw=${cached.amountIn} digest=${res?.digest||'(submitted)'} (~${ms}ms)`);
+      await logActivity(`[SELL SUBMITTED/HOT] ${coinType} raw=${cached.amountIn} dig=${res?.digest||'(submitted)'} ~${ms}ms`);
+      return;
+    }
+
+    // Cold path (kalau tidak ada HOT)
+    const bal = await getBalanceRaw(OWNER, coinType);
+    const amountIn = (bal * BigInt(cfg.sellPercent)) / 100n;
+    if (amountIn <= 0n || amountIn < cfg.minSellRaw) { console.log(`[SKIP] ${coinType}: saldo 0 / < minSellRaw`); return; }
+
+    const router = await ensureAftermath();
+    const route = await router.getCompleteTradeRouteGivenAmountIn({ coinInType:coinType, coinOutType:SUI, coinInAmount:amountIn });
+    if (!route || !route.routes?.length){ console.log(`[FAIL] ${coinType}: No route`); return; }
+
+    const tx = await router.getTransactionForCompleteTradeRoute({
+      walletAddress: OWNER, completeRoute: route,
+      slippage: Math.max(1, Number(cfg.slippageBps))/10_000,
+    });
+    const bytes = await tx.build({ client });
+    const res = await submitBytes(bytes);
+    const ms = (performance.now()-t0).toFixed(0);
+    console.log(`[SELL SUBMITTED/COLD] ${coinType} amountRaw=${amountIn} digest=${res?.digest||'(submitted)'} (~${ms}ms)`);
+    await logActivity(`[SELL SUBMITTED/COLD] ${coinType} raw=${amountIn} dig=${res?.digest||'(submitted)'} ~${ms}ms`);
+  }catch(e){
+    const m = e?.message || String(e);
+    console.log(`[SELL FAIL] ${coinType}: ${m}`);
+    await logActivity(`[SELL FAIL] ${coinType}: ${m}`);
+  }
+}
+
+// ---------- detector (event + checkpoint) ----------
+const RUNNERS = new Map();             // coinType -> stop()
+const POLL_MS = 80;                    // target ~80ms
+
+function transferEventType(ct){ return `0x2::coin::TransferEvent<${ct}>`; }
+
+async function detectLoop(coinType){
+  let cursor = null, nextCp = null;
+  let seenEv = new Set(), seenTx = new Set();
+
+  while (RUNNERS.has(coinType)) {
+    let triggered = false;
+
+    // 1) Event spesifik TransferEvent<coinType>
+    try{
+      const resp = await client.queryEvents({
+        query: { MoveEventType: transferEventType(coinType) },
+        cursor: cursor??null, limit: 40, order: 'descending',
+      });
+      const evs = resp?.data || [];
+      if (evs.length) cursor = evs[0].id;
+
+      for (const ev of evs){
+        if (seenEv.has(ev.id)) continue; seenEv.add(ev.id);
+        if (seenEv.size>1200) seenEv = new Set([...seenEv].slice(-400));
+
+        const pj = ev.parsedJson || {};
+        const to = String(pj.to || pj.recipient || '').toLowerCase();
+        const amt = toBig(pj.amount ?? pj.value ?? 0);
+        const mine = OWNER.toLowerCase();
+        if (amt>0n && to && to!==mine) {
+          const cfg = normalizeCfg(TOKENS.get(coinType) || {});
+          if (Date.now() - (cfg.lastSellMs||0) >= cfg.cooldownMs) {
+            TOKENS.set(coinType,{...cfg,lastSellMs:Date.now(),running:true}); await saveTokens();
+            submitHotOrCold(coinType).catch(()=>{});
+            triggered = true; break;
+          }
+        }
+      }
+    }catch{}
+
+    // 2) Checkpoint walker (ambil 3 cp)
+    if (!triggered){
+      try{
+        const latest = Number(await client.getLatestCheckpointSequenceNumber());
+        if (nextCp==null) nextCp = Math.max(0, latest-2);
+        let steps = 0;
+        while(steps<3 && nextCp<=latest){
+          const cp = await client.getCheckpoint({ id:String(nextCp) }); nextCp++; steps++;
+          const digs = cp?.transactions || [];
+          if (!digs.length) continue;
+          const txs = await client.multiGetTransactionBlocks({ digests:digs, options:{ showBalanceChanges:true, showEvents:false } });
+          for (const tx of (txs||[])){
+            if (!tx?.digest || seenTx.has(tx.digest)) continue; seenTx.add(tx.digest);
+            if (seenTx.size>2000) seenTx = new Set([...seenTx].slice(-700));
+            for (const bc of (tx.balanceChanges||[])){
+              if (bc?.coinType!==coinType) continue;
+              const recv = (bc?.owner?.AddressOwner || '').toLowerCase();
+              const amt  = toBig(bc.amount||'0');
+              if (amt>0n && recv && recv!==OWNER.toLowerCase()){
+                const cfg = normalizeCfg(TOKENS.get(coinType)||{});
+                if (Date.now()-(cfg.lastSellMs||0) >= cfg.cooldownMs){
+                  TOKENS.set(coinType,{...cfg,lastSellMs:Date.now(),running:true}); await saveTokens();
+                  submitHotOrCold(coinType).catch(()=>{});
+                  triggered = true; break;
+                }
+              }
+            }
+            if (triggered) break;
+          }
+          if (triggered) break;
+        }
+      }catch{}
+    }
+
+    await sleep(POLL_MS);
+  }
+}
+
+// ---------- ON/OFF ----------
+async function startAutoSell(coinType){
+  if (RUNNERS.has(coinType)) return;
+  await startPrebuilder(coinType);
+  RUNNERS.set(coinType, { stop: async()=>{ RUNNERS.delete(coinType); await stopPrebuilder(coinType); } });
+  const cfg = normalizeCfg(TOKENS.get(coinType)||{});
+  TOKENS.set(coinType,{...cfg,running:true}); await saveTokens();
+  // fire & forget
+  detectLoop(coinType).catch(async e=>{ await logActivity(`[DETECT ERROR] ${coinType}: ${e?.message||e}`); });
+  console.log(`▶️  Auto-sell ON untuk ${coinType} (events ~${POLL_MS}ms, TX panas adaptif)…`);
+}
+async function stopAutoSell(coinType){
+  const r = RUNNERS.get(coinType); if (r){ try{ await r.stop(); }catch{} }
+  RUNNERS.delete(coinType); await stopPrebuilder(coinType);
+  const cfg = normalizeCfg(TOKENS.get(coinType)||{});
+  TOKENS.set(coinType,{...cfg,running:false}); await saveTokens();
+  console.log(`⏸️  Auto-sell OFF untuk ${coinType}`);
 }
 
 // ---------- MENU ----------
-async function promptAddOrEdit(existing) {
-  const base = existing || {};
+async function promptAddOrEdit(existing){
+  const base = normalizeCfg(existing||{});
   const ans = await inquirer.prompt([
-    { name: 'coinType', message: 'Full coin type (0x..::mod::SYMBOL)', default: base.coinType, when: !existing },
-    { name: 'sellPercent', message: 'Sell %', default: base.sellPercent ?? DEFAULTS.sellPercent, filter: Number },
-    { name: 'minSellRaw', message: 'Min sell (raw units)', default: base.minSellRaw ?? DEFAULTS.minSellRaw.toString(), filter: v => BigInt(v) },
-    { name: 'cooldownMs', message: 'Cooldown (ms)', default: base.cooldownMs ?? DEFAULTS.cooldownMs, filter: Number },
-    {
-      type: 'list', name: 'dex', message: 'DEX',
-      choices: [
-        { name: 'Cetus Aggregator (recommended)', value: 'cetus_agg' },
-        { name: 'FlowX', value: 'flowx' },
-        { name: 'BlueMove (via Aggregator)', value: 'bluemove' },
-      ],
-      default: base.dex ?? DEFAULTS.dexPref,
-    },
-    { name: 'slippageBps', message: 'Slippage (bps, 100=1%)', default: base.slippageBps ?? DEFAULTS.slippageBps, filter: Number },
+    { name:'coinType', message:'Coin type (0x..::mod::SYMBOL)', when: !existing, validate:v=>isCoinType(v)||'Format salah' },
+    { name:'sellPercent', message:'Sell %', default: base.sellPercent, filter:Number },
+    { name:'minSellRaw', message:'Min sell (raw units)', default: base.minSellRaw.toString(), filter:v=>BigInt(v) },
+    { name:'cooldownMs', message:'Cooldown antar SELL (ms)', default: base.cooldownMs, filter:Number },
+    { name:'slippageBps', message:'Slippage (bps)', default: base.slippageBps, filter:Number },
   ]);
   return ans;
 }
-
-function renderTable() {
-  const rows = [];
-  for (const [k, v] of tokenMap) {
-    rows.push({
-      coinType: k,
-      sellPct: v.sellPercent,
-      minRaw: v.minSellRaw.toString(),
-      cooldownMs: v.cooldownMs,
-      slippageBps: v.slippageBps,
-      dex: v.dex,
-      running: !!v.running,
-      lastSell: v.lastSellMs ? new Date(v.lastSellMs).toLocaleTimeString() : '-',
-    });
+function renderTable(){
+  const rows=[];
+  for (const [k,vr] of TOKENS){
+    const v = normalizeCfg(vr);
+    rows.push({ coinType:k, sellPct:v.sellPercent, minRaw:v.minSellRaw.toString(), cooldownMs:v.cooldownMs, slippageBps:v.slippageBps, running:!!v.running, lastSell:v.lastSellMs? new Date(v.lastSellMs).toLocaleTimeString():'-'});
   }
   console.table(rows);
 }
+async function viewActivityLog(){
+  const buf = await readFile(LOG_PATH,'utf8').catch(()=> '');
+  const lines = buf? buf.trim().split('\n'): [];
+  console.log('\n===== ACTIVITY LOG (last 200) =====');
+  console.log(lines.slice(-200).join('\n') || '(log kosong)');
+  console.log('===================================\n');
+  await inquirer.prompt([{ type:'input', name:'ok', message:'Enter untuk kembali' }]);
+}
+async function autoStartSaved(){
+  // normalisasi + auto-ON yg tersimpan
+  const fixed = new Map();
+  for (const [k,v] of TOKENS) fixed.set(k, normalizeCfg(v));
+  TOKENS = fixed; await saveTokens();
+  for (const [k,v] of TOKENS) if (v.running) startAutoSell(k);
+}
 
-async function menu() {
-  console.log('RPC:', HTTP_URL);
-  console.log('Owner:', OWNER);
+async function menu(){
+  await autoStartSaved();
+  while(true){
+    const suiBal = await getSuiBalanceStr();
+    console.log(`\nRPC: ${HTTP_URL}`);
+    console.log(`Owner: ${OWNER}`);
+    console.log(`SUI Balance: ${suiBal}`);
 
-  while (true) {
     const { action } = await inquirer.prompt({
-      type: 'list',
-      name: 'action',
-      message: 'Pilih menu',
-      choices: [
-        { name: '➕ Tambah token target', value: 'add' },
-        { name: '✏️  Ubah token target', value: 'edit' },
-        { name: '🗑️  Hapus token', value: 'remove' },
-        { name: '▶️  Start semua token', value: 'start_all' },
-        { name: '⏸️  Stop token tertentu', value: 'stop_one' },
-        { name: '📋 Lihat status token', value: 'list' },
-        { name: '🚀 Test SELL sekali (token tertentu)', value: 'oneshot' },
-        { name: 'Keluar', value: 'exit' },
-      ],
+      type:'list', name:'action', message:'Pilih menu', pageSize:12, choices:[
+        { name:'➕ Tambah token', value:'add' },
+        { name:'✏️  Ubah token', value:'edit' },
+        { name:'🚀 Test SELL sekali (submit sekarang)', value:'oneshot' },
+        { name:'⚡ Auto-sell ON/OFF (pilih & tentukan %)', value:'toggle' },
+        { name:'📋 Lihat status token', value:'list' },
+        { name:'📜 Lihat activity.log (last 200)', value:'log' },
+        { name:'Keluar', value:'exit' },
+      ]
     });
 
-    if (action === 'add') {
-      const ans = await promptAddOrEdit();
-      if (tokenMap.has(ans.coinType)) {
-        console.log('Token sudah ada. Gunakan menu Ubah.');
-      } else {
-        tokenMap.set(ans.coinType, { ...ans, running: false, lastSellMs: 0 });
-        console.log(`[ADD] ${ans.coinType}`);
-      }
+    if (action==='add'){
+      const a = await promptAddOrEdit();
+      if (TOKENS.has(a.coinType)) console.log('Token sudah ada. Pakai menu Ubah.');
+      else { TOKENS.set(a.coinType,{...normalizeCfg(a), running:false, lastSellMs:0}); await saveTokens(); console.log(`[ADD] ${a.coinType}`); }
     }
 
-    if (action === 'edit') {
-      if (tokenMap.size === 0) { console.log('Belum ada token.'); continue; }
-      const { key } = await inquirer.prompt({ type: 'list', name: 'key', message: 'Pilih token', choices: [...tokenMap.keys()] });
-      const cur = tokenMap.get(key);
+    if (action==='edit'){
+      if (!TOKENS.size){ console.log('Belum ada token.'); continue; }
+      const {key} = await inquirer.prompt({ type:'list', name:'key', message:'Pilih token', choices:[...TOKENS.keys()] });
+      const cur = TOKENS.get(key);
       const upd = await promptAddOrEdit(cur);
-      tokenMap.set(key, { ...cur, ...upd });
-      console.log(`[EDIT] ${key}`);
+      TOKENS.set(key, { ...normalizeCfg(cur), ...normalizeCfg(upd) }); await saveTokens(); console.log(`[EDIT] ${key}`);
     }
 
-    if (action === 'remove') {
-      if (tokenMap.size === 0) { console.log('Belum ada token.'); continue; }
-      const { key } = await inquirer.prompt({ type: 'list', name: 'key', message: 'Pilih token', choices: [...tokenMap.keys()] });
-      await stopListener(key);
-      tokenMap.delete(key);
-      console.log(`[DEL] ${key}`);
+    if (action==='oneshot'){
+      if (!TOKENS.size){ console.log('Belum ada token.'); continue; }
+      const {key} = await inquirer.prompt({ type:'list', name:'key', message:'Pilih token', choices:[...TOKENS.keys()] });
+      console.log(`[SUBMIT SELL] ${key}…`);
+      await submitHotOrCold(key);
     }
 
-    if (action === 'start_all') {
-      if (tokenMap.size === 0) { console.log('Belum ada token.'); continue; }
-      for (const key of tokenMap.keys()) startListener(key);
-      console.log('Bot berjalan di background (listener tetap running).');
-    }
-
-    if (action === 'stop_one') {
-      if (tokenMap.size === 0) { console.log('Belum ada token.'); continue; }
-      const { key } = await inquirer.prompt({ type: 'list', name: 'key', message: 'Pilih token', choices: [...tokenMap.keys()] });
-      await stopListener(key);
-    }
-
-    if (action === 'list') {
-      renderTable();
-    }
-
-    if (action === 'oneshot') {
-      if (tokenMap.size === 0) { console.log('Belum ada token.'); continue; }
-      const { key } = await inquirer.prompt({ type: 'list', name: 'key', message: 'Pilih token', choices: [...tokenMap.keys()] });
-      const cfg = tokenMap.get(key);
-      console.log(`[TEST SELL] ${key}…`);
-      try {
-        const res = await sellOnce({ coinType: key, cfg });
-        if (res?.effects?.status?.status === 'success') console.log(`[OK] ${key} tx=${res.digest}`);
-        else if (res?.skipped) console.log(`[SKIP] ${key}: ${res.skipped}`);
-        else console.log(`[WARN] ${key}: unknown result`);
-      } catch (e) {
-        console.log(`[ERR] ${key}:`, e?.message || e);
+    if (action==='toggle'){
+      if (!TOKENS.size){ console.log('Belum ada token.'); continue; }
+      const {key} = await inquirer.prompt({ type:'list', name:'key', message:'Pilih token', choices:[...TOKENS.keys()] });
+      const cur = normalizeCfg(TOKENS.get(key)||{});
+      if (!cur.running){
+        const { pct } = await inquirer.prompt([{ name:'pct', message:'Sell % saat Auto-sell', default: cur.sellPercent, filter:Number }]);
+        const newCfg = { ...cur, sellPercent: Math.min(100, Math.max(1, Number(pct)||cur.sellPercent)) };
+        TOKENS.set(key, newCfg); await saveTokens();
+        await startAutoSell(key);
+      } else {
+        await stopAutoSell(key);
       }
     }
 
-    if (action === 'exit') {
-      console.log('Bye');
-      process.exit(0);
-    }
+    if (action==='list') renderTable();
+    if (action==='log') await viewActivityLog();
+    if (action==='exit'){ console.log('Bye'); process.exit(0); }
   }
 }
 
-menu().catch((e) => {
-  console.error('Fatal:', e);
-  process.exit(1);
-});
+// ---------- safety ----------
+process.on('unhandledRejection', async(e)=>{ await logActivity(`[WARN] UnhandledRejection: ${e?.message||e}`); });
+process.on('uncaughtException', async(e)=>{ await logActivity(`[WARN] UncaughtException: ${e?.message||e}`); });
+
+// ---------- run ----------
+menu().catch(async(e)=>{ console.error('Fatal:', e?.message||e); await logActivity(`[FATAL] ${e?.message||String(e)}`); process.exit(1); });
