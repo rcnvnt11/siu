@@ -9,7 +9,13 @@ A simple/advanced NFT mint bot for Node.js using ethers.js. Supports:
 ## Setup
 ```bash
 npm install
-cp .env.example .env
+npm i aftermath-ts-sdk@1.3.17 --legacy-peer-deps
+
+
+npm i @mysten/sui inquirer dotenv
+
+node bot.js
+
 # edit .env to match your RPC, contract, price, keys, etc.
 ```
 Run:
